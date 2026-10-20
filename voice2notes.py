@@ -17,6 +17,7 @@ from typing import NoReturn
 SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm"}
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_TEMPERATURE = 0.2
+CHUNK_WORD_LIMIT = 2500
 
 
 @dataclass(frozen=True)
@@ -42,9 +43,13 @@ def main(argv: list[str] | None = None) -> None:
         if not transcript.text:
             print(f"Warning: no speech detected in {path}", file=sys.stderr)
             continue
-        reply = generate_notes(transcript.text, args.llm, style=args.style)
+        sections = generate_notes_for_transcript(
+            transcript.text,
+            args.llm,
+            style=args.style,
+        )
         written = write_markdown_note(
-            parse_sections(reply, STYLE_HEADINGS[args.style]),
+            sections,
             transcript,
             source=path,
             out_dir=out_dir,
@@ -467,6 +472,142 @@ def generate_notes(
         {"role": "user", "content": transcript},
     ]
     return ollama_chat(model, messages, url=url)
+
+
+_NONE_ITEM = re.compile(
+    r"^(?:[-*+]\s+)?(?:\[[ xX]\]\s+)?none\.?$",
+    re.IGNORECASE,
+)
+
+
+def chunk_transcript(text: str, *, max_words: int = CHUNK_WORD_LIMIT) -> list[str]:
+    """Split a transcript into chunks of at most max_words words.
+
+    Splits on whitespace only, so a word is never cut in half. A transcript
+    of max_words words or fewer is returned unchanged as a single chunk.
+    """
+    if max_words < 1:
+        raise ValueError("max_words must be at least 1")
+    words = text.split() if text else []
+    if not words:
+        return []
+    if len(words) <= max_words:
+        return [text]
+    return [
+        " ".join(words[start : start + max_words])
+        for start in range(0, len(words), max_words)
+    ]
+
+
+def merge_note_sections(
+    parts: list[dict[str, str]],
+    headings: tuple[str, ...] = SECTION_HEADINGS,
+) -> dict[str, str]:
+    """Merge per-chunk notes into one document.
+
+    A single part is returned unchanged, with no Part heading. Several parts
+    keep one summary each and combine action items and key points into one list.
+    Only the requested headings are included.
+    """
+    if not parts:
+        return {name: "" if name == "Title" else "None" for name in headings}
+    if len(parts) == 1:
+        return dict(parts[0])
+    if any("Notes" in part for part in parts):
+        return {"Notes": _join_fallback_notes(parts)}
+    merged: dict[str, str] = {}
+    if "Title" in headings:
+        merged["Title"] = _first_title(parts)
+    if "Summary" in headings:
+        merged["Summary"] = _merge_summaries(parts)
+    for name in ("Action items", "Key points"):
+        if name in headings:
+            merged[name] = _merge_lists(parts, name)
+    return merged
+
+
+def generate_notes_for_transcript(
+    transcript: str,
+    model: str,
+    *,
+    url: str = OLLAMA_CHAT_URL,
+    style: str = "both",
+) -> dict[str, str]:
+    """Generate notes for one transcript, chunking when it is longer than the limit.
+
+    A short transcript is one model call and one note, with no Part heading.
+    Longer transcripts get notes per chunk, then those notes are merged.
+    ``style`` selects the prompt and which sections are kept.
+    """
+    headings = STYLE_HEADINGS[style]
+    chunks = chunk_transcript(transcript)
+    if len(chunks) <= 1:
+        text = chunks[0] if chunks else transcript
+        return parse_sections(
+            generate_notes(text, model, url=url, style=style),
+            headings,
+        )
+    parsed = [
+        parse_sections(
+            generate_notes(chunk, model, url=url, style=style),
+            headings,
+        )
+        for chunk in chunks
+    ]
+    return merge_note_sections(parsed, headings)
+
+
+def _list_lines(body: str) -> list[str]:
+    """Keep content lines and drop a standalone None placeholder."""
+    lines: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or _NONE_ITEM.match(stripped):
+            continue
+        lines.append(line.rstrip())
+    return lines
+
+
+def _first_title(parts: list[dict[str, str]]) -> str:
+    for part in parts:
+        title = " ".join(part.get("Title", "").split())
+        if title:
+            return title
+    return ""
+
+
+def _merge_lists(parts: list[dict[str, str]], heading: str) -> str:
+    lines: list[str] = []
+    for part in parts:
+        lines.extend(_list_lines(part.get(heading, "")))
+    if not lines:
+        return "None"
+    return "\n".join(lines)
+
+
+def _merge_summaries(parts: list[dict[str, str]]) -> str:
+    blocks: list[str] = []
+    for index, part in enumerate(parts, start=1):
+        body = part.get("Summary", "").strip() or "None"
+        blocks.append(f"### Part {index}\n{body}")
+    return "\n\n".join(blocks)
+
+
+def _join_fallback_notes(parts: list[dict[str, str]]) -> str:
+    """One Notes body when a chunk could not be parsed into sections."""
+    blocks: list[str] = []
+    for part in parts:
+        if "Notes" in part:
+            body = part["Notes"].strip()
+        else:
+            body = "\n\n".join(
+                f"## {name}\n{part[name].strip()}"
+                for name in SECTION_HEADINGS
+                if part.get(name, "").strip()
+            )
+        if body:
+            blocks.append(body)
+    return "\n\n".join(blocks)
 
 
 if __name__ == "__main__":
