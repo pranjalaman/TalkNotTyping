@@ -194,3 +194,4 @@ notes/
 *.ogg
 *.flac
 *.webm
+!tests/fixtures/sample.wav
