@@ -179,5 +179,18 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local planning notes (not part of the shipped tool)
 ISSUES.md
 SPEC.md
+
+# Generated notes
+notes/
+
+# Audio inputs stay on disk
+*.mp3
+*.m4a
+*.wav
+*.ogg
+*.flac
+*.webm
