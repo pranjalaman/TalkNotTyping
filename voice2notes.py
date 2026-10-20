@@ -43,7 +43,11 @@ def main(argv: list[str] | None = None) -> None:
         if not transcript.text:
             print(f"Warning: no speech detected in {path}", file=sys.stderr)
             continue
-        sections = generate_notes_for_transcript(transcript.text, args.llm)
+        sections = generate_notes_for_transcript(
+            transcript.text,
+            args.llm,
+            style=args.style,
+        )
         written = write_markdown_note(
             sections,
             transcript,
@@ -254,7 +258,7 @@ def _exit_model_not_pulled(model: str) -> NoReturn:
     raise SystemExit(1)
 
 
-# NOTES_SYSTEM_PROMPT is the only notes prompt. Edit this constant.
+# Edit the prompt for each --style value here. `both` is the default.
 NOTES_SYSTEM_PROMPT = """\
 You turn messy spoken transcripts into clean notes. Use only what is in the transcript. Do not invent tasks, names, dates, or facts. If there are no action items, write None.
 
@@ -270,15 +274,56 @@ Spoken-language cleanup:
 - Keep the user's own wording for names and technical terms.
 """
 
+TODO_SYSTEM_PROMPT = """\
+You turn messy spoken transcripts into action items. Use only what is in the transcript. Do not invent tasks, names, dates, or facts. If there are no action items, write None.
+
+The user message is the transcript. Return markdown with exactly this heading:
+## Action items
+
+Spoken-language cleanup:
+- Remove filler words.
+- Resolve "um, I mean" self-corrections. Keep the corrected meaning and drop the abandoned attempt.
+- Keep the user's own wording for names and technical terms.
+"""
+
+SUMMARY_SYSTEM_PROMPT = """\
+You turn messy spoken transcripts into a short summary. Use only what is in the transcript. Do not invent names, dates, or facts.
+
+The user message is the transcript. Return markdown with exactly these headings:
+## Title
+## Summary
+
+Spoken-language cleanup:
+- Remove filler words.
+- Resolve "um, I mean" self-corrections. Keep the corrected meaning and drop the abandoned attempt.
+- Keep the user's own wording for names and technical terms.
+"""
+
+STYLE_PROMPTS = {
+    "both": NOTES_SYSTEM_PROMPT,
+    "todo": TODO_SYSTEM_PROMPT,
+    "summary": SUMMARY_SYSTEM_PROMPT,
+}
+
+# Title is the note's H1. The other names are the body sections written for that style.
+STYLE_HEADINGS = {
+    "both": ("Title", "Summary", "Action items", "Key points"),
+    "todo": ("Action items",),
+    "summary": ("Title", "Summary"),
+}
+
 SECTION_HEADINGS = ("Title", "Summary", "Action items", "Key points")
 _ATX_HEADING = re.compile(r"^#{1,6}\s+(.*?)(?:\s+#+)?\s*$")
 
 
-def parse_sections(model_output: str) -> dict[str, str]:
-    """Split a model reply into Title, Summary, Action items, and Key points.
+def parse_sections(
+    model_output: str,
+    headings: tuple[str, ...] = SECTION_HEADINGS,
+) -> dict[str, str]:
+    """Split a model reply into the requested headings.
 
-    If any expected heading is missing, return the raw reply under Notes
-    instead of raising.
+    If any requested heading is missing, return the raw reply under Notes
+    instead of raising. Only the requested headings are returned.
     """
     if not isinstance(model_output, str):
         model_output = "" if model_output is None else str(model_output)
@@ -295,10 +340,10 @@ def parse_sections(model_output: str) -> dict[str, str]:
         if current is not None:
             found[current].append(line)
 
-    if any(name not in found for name in SECTION_HEADINGS):
+    if any(name not in found for name in headings):
         return {"Notes": model_output}
 
-    return {name: "\n".join(found[name]).strip() for name in SECTION_HEADINGS}
+    return {name: "\n".join(found[name]).strip() for name in headings}
 
 
 def _match_section_heading(line: str) -> str | None:
@@ -331,7 +376,12 @@ def render_markdown_note(
     whisper_model: str,
     llm: str,
 ) -> str:
-    """Build the SPEC section 7 note, including a Notes fallback."""
+    """Build the note, including a Notes fallback.
+
+    Summary, Action items, and Key points are written only when that
+    heading was parsed. The title, metadata block, and full transcript
+    are always included.
+    """
     title = " ".join(sections.get("Title", "").split()) or "Notes"
     lines = [
         f"# {title}",
@@ -351,8 +401,10 @@ def render_markdown_note(
         lines.append("")
     else:
         for heading in ("Summary", "Action items", "Key points"):
+            if heading not in sections:
+                continue
             lines.append(f"## {heading}")
-            body = sections.get(heading, "").strip()
+            body = sections[heading].strip()
             if body:
                 lines.append(body)
             lines.append("")
@@ -409,10 +461,14 @@ def generate_notes(
     model: str,
     *,
     url: str = OLLAMA_CHAT_URL,
+    style: str = "both",
 ) -> str:
-    """Send a transcript to the Ollama client and return the notes reply."""
+    """Send a transcript to the Ollama client and return the notes reply.
+
+    ``style`` selects the system prompt. The default is ``both``.
+    """
     messages = [
-        {"role": "system", "content": NOTES_SYSTEM_PROMPT},
+        {"role": "system", "content": STYLE_PROMPTS[style]},
         {"role": "user", "content": transcript},
     ]
     return ollama_chat(model, messages, url=url)
@@ -443,29 +499,31 @@ def chunk_transcript(text: str, *, max_words: int = CHUNK_WORD_LIMIT) -> list[st
     ]
 
 
-def merge_note_sections(parts: list[dict[str, str]]) -> dict[str, str]:
+def merge_note_sections(
+    parts: list[dict[str, str]],
+    headings: tuple[str, ...] = SECTION_HEADINGS,
+) -> dict[str, str]:
     """Merge per-chunk notes into one document.
 
     A single part is returned unchanged, with no Part heading. Several parts
     keep one summary each and combine action items and key points into one list.
+    Only the requested headings are included.
     """
     if not parts:
-        return {
-            "Title": "",
-            "Summary": "None",
-            "Action items": "None",
-            "Key points": "None",
-        }
+        return {name: "" if name == "Title" else "None" for name in headings}
     if len(parts) == 1:
         return dict(parts[0])
     if any("Notes" in part for part in parts):
         return {"Notes": _join_fallback_notes(parts)}
-    return {
-        "Title": _first_title(parts),
-        "Summary": _merge_summaries(parts),
-        "Action items": _merge_lists(parts, "Action items"),
-        "Key points": _merge_lists(parts, "Key points"),
-    }
+    merged: dict[str, str] = {}
+    if "Title" in headings:
+        merged["Title"] = _first_title(parts)
+    if "Summary" in headings:
+        merged["Summary"] = _merge_summaries(parts)
+    for name in ("Action items", "Key points"):
+        if name in headings:
+            merged[name] = _merge_lists(parts, name)
+    return merged
 
 
 def generate_notes_for_transcript(
@@ -473,20 +531,30 @@ def generate_notes_for_transcript(
     model: str,
     *,
     url: str = OLLAMA_CHAT_URL,
+    style: str = "both",
 ) -> dict[str, str]:
     """Generate notes for one transcript, chunking when it is longer than the limit.
 
     A short transcript is one model call and one note, with no Part heading.
     Longer transcripts get notes per chunk, then those notes are merged.
+    ``style`` selects the prompt and which sections are kept.
     """
+    headings = STYLE_HEADINGS[style]
     chunks = chunk_transcript(transcript)
     if len(chunks) <= 1:
         text = chunks[0] if chunks else transcript
-        return parse_sections(generate_notes(text, model, url=url))
+        return parse_sections(
+            generate_notes(text, model, url=url, style=style),
+            headings,
+        )
     parsed = [
-        parse_sections(generate_notes(chunk, model, url=url)) for chunk in chunks
+        parse_sections(
+            generate_notes(chunk, model, url=url, style=style),
+            headings,
+        )
+        for chunk in chunks
     ]
-    return merge_note_sections(parsed)
+    return merge_note_sections(parsed, headings)
 
 
 def _list_lines(body: str) -> list[str]:
