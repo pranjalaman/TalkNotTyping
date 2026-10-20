@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm"}
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+OLLAMA_TEMPERATURE = 0.2
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,84 @@ def transcribe_file(model, path: Path, language: str | None) -> Transcript:
         segment.text.strip() for segment in segments if segment.text.strip()
     )
     return Transcript(text=text, language=info.language, duration=info.duration)
+
+
+def ollama_setup_message(model: str) -> str:
+    """Hint printed when Ollama is down or the requested model is not pulled."""
+    return (
+        f"Start Ollama (`ollama serve`) and pull the model (`ollama pull {model}`)"
+    )
+
+
+def ollama_chat(
+    model: str,
+    messages: list[dict[str, str]],
+    *,
+    url: str = OLLAMA_CHAT_URL,
+    timeout: float = 300,
+) -> str:
+    """Return the assistant text from Ollama `/api/chat`.
+
+    A connection failure and a missing model each print the setup hint and exit 1.
+    """
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {"temperature": OLLAMA_TEMPERATURE},
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if _ollama_model_missing(exc.code, detail):
+            _exit_model_not_pulled(model)
+        print(
+            f"Ollama request failed ({exc.code}): {detail or exc.reason}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except urllib.error.URLError:
+        _exit_ollama_not_running(model)
+
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        content = body["message"]["content"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(f"Ollama returned an unexpected response: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(content, str):
+        print(
+            "Ollama returned an unexpected response: message content missing",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    return content
+
+
+def _ollama_model_missing(status: int, detail: str) -> bool:
+    """True for HTTP 404 or an Ollama body that says the model was not found."""
+    if status == 404:
+        return True
+    lowered = detail.lower()
+    return "model" in lowered and "not found" in lowered
+
+
+def _exit_ollama_not_running(model: str) -> NoReturn:
+    print(ollama_setup_message(model), file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _exit_model_not_pulled(model: str) -> NoReturn:
+    print(ollama_setup_message(model), file=sys.stderr)
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
