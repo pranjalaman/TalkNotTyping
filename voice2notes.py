@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -40,12 +41,13 @@ def main(argv: list[str] | None = None) -> None:
         if not transcript.text:
             print(f"Warning: no speech detected in {path}", file=sys.stderr)
             continue
+        reply = generate_notes(transcript.text, args.llm)
         if printed:
             print()
         print(transcript.text)
         printed = True
         print()
-        print(generate_notes(transcript.text, args.llm))
+        print(format_sections(parse_sections(reply)))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -262,6 +264,59 @@ Spoken-language cleanup:
 - Resolve "um, I mean" self-corrections. Keep the corrected meaning and drop the abandoned attempt.
 - Keep the user's own wording for names and technical terms.
 """
+
+SECTION_HEADINGS = ("Title", "Summary", "Action items", "Key points")
+_ATX_HEADING = re.compile(r"^#{1,6}\s+(.*?)(?:\s+#+)?\s*$")
+
+
+def parse_sections(model_output: str) -> dict[str, str]:
+    """Split a model reply into Title, Summary, Action items, and Key points.
+
+    If any expected heading is missing, return the raw reply under Notes
+    instead of raising.
+    """
+    if not isinstance(model_output, str):
+        model_output = "" if model_output is None else str(model_output)
+
+    found: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in model_output.splitlines():
+        heading = _match_section_heading(line)
+        if heading is not None:
+            if heading not in found:
+                found[heading] = []
+                current = heading
+            continue
+        if current is not None:
+            found[current].append(line)
+
+    if any(name not in found for name in SECTION_HEADINGS):
+        return {"Notes": model_output}
+
+    return {name: "\n".join(found[name]).strip() for name in SECTION_HEADINGS}
+
+
+def format_sections(sections: dict[str, str]) -> str:
+    """Render parsed sections as markdown headings without writing a file."""
+    blocks: list[str] = []
+    for heading, body in sections.items():
+        if body:
+            blocks.append(f"## {heading}\n{body}")
+        else:
+            blocks.append(f"## {heading}")
+    return "\n\n".join(blocks)
+
+
+def _match_section_heading(line: str) -> str | None:
+    match = _ATX_HEADING.match(line.strip())
+    if match is None:
+        return None
+    text = match.group(1).strip().rstrip(":").strip()
+    folded = text.casefold()
+    for name in SECTION_HEADINGS:
+        if folded == name.casefold():
+            return name
+    return None
 
 
 def generate_notes(
