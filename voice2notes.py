@@ -13,9 +13,10 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from contextlib import redirect_stderr
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NoReturn
@@ -52,7 +53,7 @@ def main(argv: list[str] | None = None) -> None:
     out_dir = Path(args.out)
     for path in args.files:
         try:
-            written = process_audio_file(
+            note, exports = process_audio_file(
                 model,
                 path,
                 lang=args.lang,
@@ -60,11 +61,14 @@ def main(argv: list[str] | None = None) -> None:
                 style=args.style,
                 out_dir=out_dir,
                 whisper_model=args.whisper_model,
+                export=args.export,
             )
         except PipelineError as exc:
             print(exc, file=sys.stderr)
             continue
-        print(written)
+        print(note)
+        for exported in exports:
+            print(exported)
 
 
 def process_audio_file(
@@ -76,7 +80,8 @@ def process_audio_file(
     style: str,
     out_dir: Path,
     whisper_model: str,
-) -> Path:
+    export: list[str] | None = None,
+) -> tuple[Path, list[Path]]:
     """Transcribe one file and write its note. Raise PipelineError to skip it."""
     try:
         transcript = transcribe_file(model, path, lang)
@@ -85,7 +90,7 @@ def process_audio_file(
     if not transcript.text:
         raise PipelineError(f"Warning: no speech detected in {path}")
     sections = generate_notes_for_transcript(transcript.text, llm, style=style)
-    return write_markdown_note(
+    note = write_markdown_note(
         sections,
         transcript,
         source=path,
@@ -93,6 +98,14 @@ def process_audio_file(
         whisper_model=whisper_model,
         llm=llm,
     )
+    exports = write_action_item_exports(
+        sections,
+        transcript.text,
+        note,
+        day=date.today(),
+        kinds=export or [],
+    )
+    return note, exports
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,6 +162,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="poll interval in watch mode (default: 10)",
     )
     parser.add_argument(
+        "--export",
+        action="append",
+        choices=("todo", "ics"),
+        default=None,
+        help="also write action items as todo.txt or .ics; repeat to write both. A date is included only when that date was spoken in the memo",
+    )
+    parser.add_argument(
         "--keep-audio",
         action="store_true",
         help="do not move processed audio in watch mode",
@@ -190,6 +210,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.web is not None and not 0 <= args.web <= 65535:
         parser.error("port must be between 0 and 65535")
+    chosen: list[str] = []
+    for kind in args.export or []:
+        if kind not in chosen:
+            chosen.append(kind)
+    args.export = chosen
     if args.web is None and not args.files and args.watch is None:
         parser.print_usage(sys.stderr)
         raise SystemExit(2)
@@ -620,6 +645,186 @@ def write_markdown_note(
     return path
 
 
+_MONTH_NUMBERS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+_MONTH_PATTERN = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+_ITEM_PREFIX = re.compile(r"^(?:[-*+]\s+)?(?:\[[ xX]\]\s+)?")
+_NONE_LINE = re.compile(r"none\.?$", re.IGNORECASE)
+
+
+def extract_action_items(sections: dict[str, str]) -> list[str]:
+    """Return action-item lines, dropping blanks and a standalone None."""
+    items: list[str] = []
+    for line in sections.get("Action items", "").splitlines():
+        text = _ITEM_PREFIX.sub("", line.strip()).strip()
+        if not text or _NONE_LINE.fullmatch(text):
+            continue
+        items.append(text)
+    return items
+
+
+def spoken_dates(text: str, *, default_year: int) -> list[date]:
+    """Calendar dates whose month and day appear in text, in spoken order.
+
+    A year is used when it was spoken. Otherwise default_year is used.
+    Words like "tomorrow" are not turned into a calendar date.
+    """
+    if not text:
+        return []
+    hits: list[tuple[int, int, date]] = []
+
+    def add(start: int, end: int, year: int, month: int, day: int) -> None:
+        try:
+            value = date(year, month, day)
+        except ValueError:
+            return
+        hits.append((start, end, value))
+
+    for match in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        add(match.start(), match.end(), int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+    month = rf"(?:{_MONTH_PATTERN})"
+    day = r"(\d{1,2})(?:st|nd|rd|th)?"
+    for match in re.finditer(rf"\b{day}\s+({month})\s+(\d{{4}})\b", text, re.IGNORECASE):
+        add(
+            match.start(),
+            match.end(),
+            int(match.group(3)),
+            _MONTH_NUMBERS[match.group(2).lower()],
+            int(match.group(1)),
+        )
+    for match in re.finditer(rf"\b({month})\s+{day}(?:,)?\s+(\d{{4}})\b", text, re.IGNORECASE):
+        add(
+            match.start(),
+            match.end(),
+            int(match.group(3)),
+            _MONTH_NUMBERS[match.group(1).lower()],
+            int(match.group(2)),
+        )
+    for match in re.finditer(rf"\b{day}\s+({month})\b", text, re.IGNORECASE):
+        add(
+            match.start(),
+            match.end(),
+            default_year,
+            _MONTH_NUMBERS[match.group(2).lower()],
+            int(match.group(1)),
+        )
+    for match in re.finditer(rf"\b({month})\s+{day}\b", text, re.IGNORECASE):
+        add(
+            match.start(),
+            match.end(),
+            default_year,
+            _MONTH_NUMBERS[match.group(1).lower()],
+            int(match.group(2)),
+        )
+
+    hits.sort(key=lambda hit: (hit[0], hit[0] - hit[1]))
+    kept: list[date] = []
+    covered_until = -1
+    for start, end, value in hits:
+        if start < covered_until:
+            continue
+        covered_until = end
+        if value not in kept:
+            kept.append(value)
+    return kept
+
+
+def due_date_for_item(item: str, transcript: str, *, default_year: int) -> date | None:
+    """Return the item's first calendar date that also appears in the transcript."""
+    spoken = set(spoken_dates(transcript, default_year=default_year))
+    for candidate in spoken_dates(item, default_year=default_year):
+        if candidate in spoken:
+            return candidate
+    return None
+
+
+def _ics_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def render_todo_txt(items: list[tuple[str, date | None]]) -> str:
+    lines = []
+    for text, due in items:
+        if due is None:
+            lines.append(text)
+        else:
+            lines.append(f"{text} due:{due.isoformat()}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def render_ics(items: list[tuple[str, date | None]], *, stamp: datetime) -> str:
+    stamped = stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//TalkNotTyping//EN",
+        "CALSCALE:GREGORIAN",
+    ]
+    for text, due in items:
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                f"UID:{uuid.uuid4()}@talknottyping",
+                f"DTSTAMP:{stamped}",
+                f"SUMMARY:{_ics_text(text)}",
+            ]
+        )
+        if due is not None:
+            lines.append(f"DTSTART;VALUE=DATE:{due.strftime('%Y%m%d')}")
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\n".join(lines) + "\n"
+
+
+def write_action_item_exports(
+    sections: dict[str, str],
+    transcript: str,
+    note_path: Path,
+    *,
+    day: date,
+    kinds: list[str],
+) -> list[Path]:
+    """Write todo.txt and/or .ics next to the note. Skip dates the memo never said."""
+    paired = [
+        (item, due_date_for_item(item, transcript, default_year=day.year))
+        for item in extract_action_items(sections)
+    ]
+    written: list[Path] = []
+    for kind in kinds:
+        if kind == "todo":
+            path = note_path.with_name(note_path.stem + ".todo.txt")
+            path.write_text(render_todo_txt(paired), encoding="utf-8", newline="\n")
+        elif kind == "ics":
+            path = note_path.with_suffix(".ics")
+            path.write_text(
+                render_ics(paired, stamp=datetime.now(timezone.utc)),
+                encoding="utf-8",
+                newline="\n",
+            )
+        else:
+            continue
+        written.append(path)
+    return written
+
+
 def generate_notes(
     transcript: str,
     model: str,
@@ -799,6 +1004,10 @@ WEB_PAGE = """\
     <input id="file" type="file" hidden accept=".mp3,.m4a,.wav,.ogg,.flac,.webm,audio/*">
   </label>
 </div>
+<p>
+  <label><input id="export-todo" type="checkbox" value="todo"> todo.txt</label>
+  <label><input id="export-ics" type="checkbox" value="ics"> calendar (.ics)</label>
+</p>
 <p id="status"></p>
 <pre id="note" hidden></pre>
 <script>
@@ -817,9 +1026,10 @@ async function upload(file) {
   status.className = "";
   status.textContent = "Working on " + file.name + "…";
   note.hidden = true;
+  const kinds = ["todo", "ics"].filter((kind) => document.getElementById("export-" + kind).checked);
   const response = await fetch("/notes", {
     method: "POST",
-    headers: { "X-Filename": file.name },
+    headers: { "X-Filename": file.name, "X-Export": kinds.join(",") },
     body: file,
   });
   const payload = await response.json();
@@ -828,6 +1038,9 @@ async function upload(file) {
     return;
   }
   status.textContent = "Saved " + payload.path;
+  if (payload.exports && payload.exports.length) {
+    status.textContent += " (" + payload.exports.join(", ") + ")";
+  }
   note.hidden = false;
   note.textContent = payload.note;
 }
@@ -888,10 +1101,15 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
                 self._json(400, {"error": f"Skipping {filename}: unsupported type {shown}"})
                 return
             payload = self.rfile.read(length)
+            export = [
+                kind
+                for kind in self.headers.get("X-Export", "").split(",")
+                if kind in ("todo", "ics")
+            ]
             captured = io.StringIO()
             try:
                 with redirect_stderr(captured):
-                    written = self._process(filename, payload)
+                    written, exports = self._process(filename, payload, export)
             except PipelineError as exc:
                 self._json(400, {"error": str(exc)})
                 return
@@ -901,10 +1119,14 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
                 return
             self._json(
                 200,
-                {"note": written.read_text(encoding="utf-8"), "path": str(written)},
+                {
+                    "note": written.read_text(encoding="utf-8"),
+                    "path": str(written),
+                    "exports": [str(path) for path in exports],
+                },
             )
 
-        def _process(self, filename: str, payload: bytes) -> Path:
+        def _process(self, filename: str, payload: bytes, export: list[str]) -> tuple[Path, list[Path]]:
             with model_lock:
                 if model_box["model"] is None:
                     model_box["model"] = load_whisper_model(args.whisper_model)
@@ -920,6 +1142,7 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
                     style=args.style,
                     out_dir=Path(args.out),
                     whisper_model=args.whisper_model,
+                    export=export,
                 )
 
         def _send(self, status: int, body: bytes, content_type: str) -> None:
