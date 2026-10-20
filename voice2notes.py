@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import argparse
 import errno
+import io
 import json
 import re
 import sys
+import tempfile
+import threading
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr
 from dataclasses import dataclass
 from datetime import date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NoReturn
 
@@ -19,6 +24,9 @@ SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm"}
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_TEMPERATURE = 0.2
 CHUNK_WORD_LIMIT = 2500
+WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8765
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -28,36 +36,63 @@ class Transcript:
     duration: float
 
 
+class PipelineError(Exception):
+    """One audio file could not become a note."""
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the voice-to-notes pipeline."""
     args = parse_args(argv)
+    if args.web is not None:
+        serve_web(args, port=args.web)
+        return
     if not args.files:
         return
     model = load_whisper_model(args.whisper_model)
     out_dir = Path(args.out)
     for path in args.files:
         try:
-            transcript = transcribe_file(model, path, args.lang)
-        except Exception as exc:
-            print(f"Skipping {path}: {exc}", file=sys.stderr)
+            written = process_audio_file(
+                model,
+                path,
+                lang=args.lang,
+                llm=args.llm,
+                style=args.style,
+                out_dir=out_dir,
+                whisper_model=args.whisper_model,
+            )
+        except PipelineError as exc:
+            print(exc, file=sys.stderr)
             continue
-        if not transcript.text:
-            print(f"Warning: no speech detected in {path}", file=sys.stderr)
-            continue
-        sections = generate_notes_for_transcript(
-            transcript.text,
-            args.llm,
-            style=args.style,
-        )
-        written = write_markdown_note(
-            sections,
-            transcript,
-            source=path,
-            out_dir=out_dir,
-            whisper_model=args.whisper_model,
-            llm=args.llm,
-        )
         print(written)
+
+
+def process_audio_file(
+    model,
+    path: Path,
+    *,
+    lang: str | None,
+    llm: str,
+    style: str,
+    out_dir: Path,
+    whisper_model: str,
+) -> Path:
+    """Transcribe one file and write its note. Raise PipelineError to skip it."""
+    try:
+        transcript = transcribe_file(model, path, lang)
+    except Exception as exc:
+        raise PipelineError(f"Skipping {path}: {exc}") from exc
+    if not transcript.text:
+        raise PipelineError(f"Warning: no speech detected in {path}")
+    sections = generate_notes_for_transcript(transcript.text, llm, style=style)
+    return write_markdown_note(
+        sections,
+        transcript,
+        source=path,
+        out_dir=out_dir,
+        whisper_model=whisper_model,
+        llm=llm,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -118,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not move processed audio in watch mode",
     )
+    parser.add_argument(
+        "--web",
+        nargs="?",
+        const=DEFAULT_WEB_PORT,
+        default=None,
+        type=int,
+        metavar="PORT",
+        help=f"serve a local drag-and-drop page on {WEB_HOST} (default port: {DEFAULT_WEB_PORT})",
+    )
     return parser
 
 
@@ -144,7 +188,9 @@ def validate_audio_files(paths: list[str]) -> list[Path]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.files and args.watch is None:
+    if args.web is not None and not 0 <= args.web <= 65535:
+        parser.error("port must be between 0 and 65535")
+    if args.web is None and not args.files and args.watch is None:
         parser.print_usage(sys.stderr)
         raise SystemExit(2)
     args.files = validate_audio_files(args.files)
@@ -726,6 +772,184 @@ def _join_fallback_notes(parts: list[dict[str, str]]) -> str:
         if body:
             blocks.append(body)
     return "\n\n".join(blocks)
+
+
+WEB_PAGE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TalkNotTyping</title>
+<style>
+  body { font-family: Georgia, serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; color: #1c1c1c; }
+  #drop { border: 2px dashed #888; border-radius: 8px; padding: 2rem 1rem; text-align: center; }
+  #drop.over { background: #f3f3f3; }
+  button, label.pick { font: inherit; }
+  pre { white-space: pre-wrap; background: #f7f7f7; padding: 1rem; border-radius: 8px; }
+  .error { color: #8a1f1f; }
+</style>
+</head>
+<body>
+<h1>TalkNotTyping</h1>
+<p>Drop a voice memo. Transcription and the note stay on this computer.</p>
+<div id="drop">
+  Drop an audio file here, or
+  <label class="pick">choose one
+    <input id="file" type="file" hidden accept=".mp3,.m4a,.wav,.ogg,.flac,.webm,audio/*">
+  </label>
+</div>
+<p id="status"></p>
+<pre id="note" hidden></pre>
+<script>
+const drop = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+const status = document.getElementById("status");
+const note = document.getElementById("note");
+
+function showError(message) {
+  status.textContent = message;
+  status.className = "error";
+  note.hidden = true;
+}
+
+async function upload(file) {
+  status.className = "";
+  status.textContent = "Working on " + file.name + "…";
+  note.hidden = true;
+  const response = await fetch("/notes", {
+    method: "POST",
+    headers: { "X-Filename": file.name },
+    body: file,
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    showError(payload.error || "Could not make a note.");
+    return;
+  }
+  status.textContent = "Saved " + payload.path;
+  note.hidden = false;
+  note.textContent = payload.note;
+}
+
+drop.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  drop.classList.add("over");
+});
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (event) => {
+  event.preventDefault();
+  drop.classList.remove("over");
+  const file = event.dataTransfer.files[0];
+  if (file) upload(file);
+});
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) upload(fileInput.files[0]);
+});
+</script>
+</body>
+</html>
+"""
+
+
+def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
+    """Build the local upload server. Bind only to the loopback interface."""
+    model_box: dict[str, object] = {"model": None}
+    model_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *log_args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            if self.path.split("?", 1)[0] != "/":
+                self._send(404, b"Not found", "text/plain; charset=utf-8")
+                return
+            self._send(200, WEB_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+
+        def do_POST(self) -> None:
+            if self.path.split("?", 1)[0] != "/notes":
+                self._json(404, {"error": "Not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                self._json(400, {"error": "Upload a non-empty audio file."})
+                return
+            if length > MAX_UPLOAD_BYTES:
+                self._json(400, {"error": "That file is larger than 100 MB."})
+                return
+            filename = Path(self.headers.get("X-Filename", "upload.wav")).name
+            suffix = Path(filename).suffix.lower()
+            if suffix not in SUPPORTED_EXTENSIONS:
+                shown = suffix or "(no extension)"
+                self._json(400, {"error": f"Skipping {filename}: unsupported type {shown}"})
+                return
+            payload = self.rfile.read(length)
+            captured = io.StringIO()
+            try:
+                with redirect_stderr(captured):
+                    written = self._process(filename, payload)
+            except PipelineError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            except SystemExit:
+                message = captured.getvalue().strip() or "The notes model is unavailable."
+                self._json(503, {"error": message})
+                return
+            self._json(
+                200,
+                {"note": written.read_text(encoding="utf-8"), "path": str(written)},
+            )
+
+        def _process(self, filename: str, payload: bytes) -> Path:
+            with model_lock:
+                if model_box["model"] is None:
+                    model_box["model"] = load_whisper_model(args.whisper_model)
+                model = model_box["model"]
+            with tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp) / filename
+                source.write_bytes(payload)
+                return process_audio_file(
+                    model,
+                    source,
+                    lang=args.lang,
+                    llm=args.llm,
+                    style=args.style,
+                    out_dir=Path(args.out),
+                    whisper_model=args.whisper_model,
+                )
+
+        def _send(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, status: int, payload: dict[str, str]) -> None:
+            self._send(
+                status,
+                json.dumps(payload).encode("utf-8"),
+                "application/json; charset=utf-8",
+            )
+
+    return ThreadingHTTPServer((WEB_HOST, port), Handler)
+
+
+def serve_web(args: argparse.Namespace, *, port: int) -> None:
+    """Serve the drag-and-drop page until Ctrl+C."""
+    server = make_web_server(args, port)
+    bound = server.server_address[1]
+    print(f"TalkNotTyping is at http://{WEB_HOST}:{bound}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
