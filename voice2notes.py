@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
                 out_dir=out_dir,
                 whisper_model=args.whisper_model,
                 export=args.export,
+                tags=args.tags,
             )
         except PipelineError as exc:
             print(exc, file=sys.stderr)
@@ -81,6 +82,7 @@ def process_audio_file(
     out_dir: Path,
     whisper_model: str,
     export: list[str] | None = None,
+    tags: list[str] | None = None,
 ) -> tuple[Path, list[Path]]:
     """Transcribe one file and write its note. Raise PipelineError to skip it."""
     try:
@@ -97,6 +99,7 @@ def process_audio_file(
         out_dir=out_dir,
         whisper_model=whisper_model,
         llm=llm,
+        tags=tags,
     )
     exports = write_action_item_exports(
         sections,
@@ -162,6 +165,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="poll interval in watch mode (default: 10)",
     )
     parser.add_argument(
+        "--tags",
+        action="append",
+        default=None,
+        metavar="TAGS",
+        help="hashtags to add to the note, separated by commas (for example: meeting,priya)",
+    )
+    parser.add_argument(
         "--export",
         action="append",
         choices=("todo", "ics"),
@@ -205,6 +215,19 @@ def validate_audio_files(paths: list[str]) -> list[Path]:
     return valid
 
 
+def normalize_tags(raw: list[str] | None) -> list[str]:
+    """Turn user text into hashtag names. Drop anything that is not a tag."""
+    tags: list[str] = []
+    for chunk in raw or []:
+        for part in chunk.split(","):
+            token = part.strip().lstrip("#")
+            token = re.sub(r"\s+", "-", token)
+            token = re.sub(r"[^0-9A-Za-z_-]", "", token).strip("-_")
+            if token and token not in tags:
+                tags.append(token)
+    return tags
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -215,6 +238,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if kind not in chosen:
             chosen.append(kind)
     args.export = chosen
+    args.tags = normalize_tags(args.tags)
     if args.web is None and not args.files and args.watch is None:
         parser.print_usage(sys.stderr)
         raise SystemExit(2)
@@ -564,6 +588,7 @@ def render_markdown_note(
     day: date,
     whisper_model: str,
     llm: str,
+    tags: list[str] | None = None,
 ) -> str:
     """Build the note, including a Notes fallback.
 
@@ -602,6 +627,9 @@ def render_markdown_note(
     if transcript_text:
         lines.append(transcript_text)
     lines.append("")
+    if tags:
+        lines.append(" ".join(f"#{tag}" for tag in tags))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -629,6 +657,7 @@ def write_markdown_note(
     llm: str,
     *,
     day: date | None = None,
+    tags: list[str] | None = None,
 ) -> Path:
     """Write one markdown note. Create out_dir and never overwrite an existing file."""
     written_on = day or date.today()
@@ -639,6 +668,7 @@ def write_markdown_note(
         day=written_on,
         whisper_model=whisper_model,
         llm=llm,
+        tags=tags,
     )
     path = unique_note_path(out_dir, source.stem, written_on)
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -1007,6 +1037,7 @@ WEB_PAGE = """\
 <p>
   <label><input id="export-todo" type="checkbox" value="todo"> todo.txt</label>
   <label><input id="export-ics" type="checkbox" value="ics"> calendar (.ics)</label>
+  <label>Tags <input id="tags" type="text" placeholder="meeting, priya"></label>
 </p>
 <p id="status"></p>
 <pre id="note" hidden></pre>
@@ -1029,7 +1060,11 @@ async function upload(file) {
   const kinds = ["todo", "ics"].filter((kind) => document.getElementById("export-" + kind).checked);
   const response = await fetch("/notes", {
     method: "POST",
-    headers: { "X-Filename": file.name, "X-Export": kinds.join(",") },
+    headers: {
+      "X-Filename": file.name,
+      "X-Export": kinds.join(","),
+      "X-Tags": document.getElementById("tags").value,
+    },
     body: file,
   });
   const payload = await response.json();
@@ -1109,7 +1144,12 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
             captured = io.StringIO()
             try:
                 with redirect_stderr(captured):
-                    written, exports = self._process(filename, payload, export)
+                    written, exports = self._process(
+                        filename,
+                        payload,
+                        export,
+                        self.headers.get("X-Tags", ""),
+                    )
             except PipelineError as exc:
                 self._json(400, {"error": str(exc)})
                 return
@@ -1126,7 +1166,13 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
                 },
             )
 
-        def _process(self, filename: str, payload: bytes, export: list[str]) -> tuple[Path, list[Path]]:
+        def _process(
+            self,
+            filename: str,
+            payload: bytes,
+            export: list[str],
+            tags_header: str,
+        ) -> tuple[Path, list[Path]]:
             with model_lock:
                 if model_box["model"] is None:
                     model_box["model"] = load_whisper_model(args.whisper_model)
@@ -1143,6 +1189,7 @@ def make_web_server(args: argparse.Namespace, port: int) -> ThreadingHTTPServer:
                     out_dir=Path(args.out),
                     whisper_model=args.whisper_model,
                     export=export,
+                    tags=normalize_tags([tags_header]),
                 )
 
         def _send(self, status: int, body: bytes, content_type: str) -> None:
