@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import re
 import sys
@@ -145,6 +146,123 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+# Hub and socket failures that mean the Whisper weights never made it onto disk.
+_WHISPER_DOWNLOAD_ERROR_NAMES = frozenset(
+    {
+        "OfflineModeIsEnabled",
+        "LocalEntryNotFoundError",
+        "IncompleteSnapshotError",
+        "RevisionResolutionError",
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "TimeoutException",
+        "NetworkError",
+        "ProxyError",
+        "ConnectionError",
+        "ConnectionRefusedError",
+        "ConnectionAbortedError",
+        "ConnectionResetError",
+        "TimeoutError",
+        "URLError",
+        "NewConnectionError",
+        "MaxRetryError",
+        "HfHubHTTPError",
+    }
+)
+_WHISPER_DOWNLOAD_MARKERS = (
+    "outgoing traffic has been disabled",
+    "cannot find an appropriate cached snapshot",
+    "cannot find the requested files in the disk cache",
+    "hf_hub_offline",
+    "cannot find the appropriate snapshot folder",
+    "getaddrinfo failed",
+    "network is unreachable",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+)
+_NETWORK_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "ENETRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "ETIMEDOUT", None),
+        getattr(errno, "EHOSTDOWN", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        10050,  # WSAENETDOWN
+        10051,  # WSAENETUNREACH
+        10052,  # WSAENETRESET
+        10053,  # WSAECONNABORTED
+        10054,  # WSAECONNRESET
+        10060,  # WSAETIMEDOUT
+        10061,  # WSAECONNREFUSED
+        10064,  # WSAEHOSTDOWN
+        10065,  # WSAEHOSTUNREACH
+        11001,  # WSAHOST_NOT_FOUND
+        11002,  # WSATRY_AGAIN
+    )
+    if isinstance(code, int)
+)
+
+
+def whisper_weights_message(model: str) -> str:
+    """Name the missing Whisper model and how to download it once."""
+    return (
+        f"Whisper model '{model}' is not downloaded. "
+        "The weights are a one-time download. "
+        "Connect to the internet and run this command again so they can be fetched. "
+        "After the download, you can force offline mode with HF_HUB_OFFLINE=1."
+    )
+
+
+def is_missing_whisper_weights(exc: BaseException) -> bool:
+    """True when loading failed because the weights are offline, the hub, or a cache miss.
+
+    Walks the exception chain so a wrapper around a hub or socket error still matches.
+    """
+    for current in _iter_exception_chain(exc):
+        names = {cls.__name__ for cls in type(current).mro()}
+        if names & _WHISPER_DOWNLOAD_ERROR_NAMES:
+            return True
+        if isinstance(current, OSError) and current.errno in _NETWORK_ERRNOS:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _WHISPER_DOWNLOAD_MARKERS):
+            return True
+    return False
+
+
+def whisper_load_failure_message(model: str, exc: BaseException) -> str:
+    """Stderr text for a WhisperModel failure. Missing weights stay free of a traceback."""
+    if is_missing_whisper_weights(exc):
+        return whisper_weights_message(model)
+    return f"Could not load Whisper model '{model}': {exc}"
+
+
+def _iter_exception_chain(exc: BaseException):
+    """Yield an exception and the causes, contexts, and grouped exceptions under it."""
+    stack: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        stack.append(current.__cause__)
+        stack.append(current.__context__)
+        grouped = getattr(current, "exceptions", None)
+        if isinstance(grouped, (tuple, list)):
+            stack.extend(grouped)
+
+
 def load_whisper_model(name: str):
     """Load faster-whisper on CPU with int8 weights."""
     try:
@@ -158,7 +276,7 @@ def load_whisper_model(name: str):
     try:
         return WhisperModel(name, device="cpu", compute_type="int8")
     except Exception as exc:
-        print(f"Could not load Whisper model '{name}': {exc}", file=sys.stderr)
+        print(whisper_load_failure_message(name, exc), file=sys.stderr)
         raise SystemExit(1)
 
 
