@@ -10,6 +10,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import NoReturn
 
@@ -31,7 +32,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.files:
         return
     model = load_whisper_model(args.whisper_model)
-    printed = False
+    out_dir = Path(args.out)
     for path in args.files:
         try:
             transcript = transcribe_file(model, path, args.lang)
@@ -42,12 +43,15 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Warning: no speech detected in {path}", file=sys.stderr)
             continue
         reply = generate_notes(transcript.text, args.llm)
-        if printed:
-            print()
-        print(transcript.text)
-        printed = True
-        print()
-        print(format_sections(parse_sections(reply)))
+        written = write_markdown_note(
+            parse_sections(reply),
+            transcript,
+            source=path,
+            out_dir=out_dir,
+            whisper_model=args.whisper_model,
+            llm=args.llm,
+        )
+        print(written)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -296,17 +300,6 @@ def parse_sections(model_output: str) -> dict[str, str]:
     return {name: "\n".join(found[name]).strip() for name in SECTION_HEADINGS}
 
 
-def format_sections(sections: dict[str, str]) -> str:
-    """Render parsed sections as markdown headings without writing a file."""
-    blocks: list[str] = []
-    for heading, body in sections.items():
-        if body:
-            blocks.append(f"## {heading}\n{body}")
-        else:
-            blocks.append(f"## {heading}")
-    return "\n\n".join(blocks)
-
-
 def _match_section_heading(line: str) -> str | None:
     match = _ATX_HEADING.match(line.strip())
     if match is None:
@@ -317,6 +310,97 @@ def _match_section_heading(line: str) -> str | None:
         if folded == name.casefold():
             return name
     return None
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration in seconds as MM:SS."""
+    if seconds < 0:
+        seconds = 0
+    total = int(seconds + 0.5)
+    minutes, secs = divmod(total, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def render_markdown_note(
+    sections: dict[str, str],
+    transcript: Transcript,
+    *,
+    source_name: str,
+    day: date,
+    whisper_model: str,
+    llm: str,
+) -> str:
+    """Build the SPEC section 7 note, including a Notes fallback."""
+    title = " ".join(sections.get("Title", "").split()) or "Notes"
+    lines = [
+        f"# {title}",
+        "",
+        f"- Source: {source_name}",
+        f"- Date: {day.isoformat()}",
+        f"- Duration: {format_duration(transcript.duration)}",
+        f"- Language: {transcript.language}",
+        f"- Models: whisper-{whisper_model}, {llm}",
+        "",
+    ]
+    if "Notes" in sections:
+        lines.append("## Notes")
+        body = sections["Notes"].strip()
+        if body:
+            lines.append(body)
+        lines.append("")
+    else:
+        for heading in ("Summary", "Action items", "Key points"):
+            lines.append(f"## {heading}")
+            body = sections.get(heading, "").strip()
+            if body:
+                lines.append(body)
+            lines.append("")
+    lines.append("## Full transcript")
+    transcript_text = transcript.text.strip()
+    if transcript_text:
+        lines.append(transcript_text)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def unique_note_path(out_dir: Path, audio_stem: str, day: date) -> Path:
+    """Return YYYY-MM-DD_<stem>.md, or the same name with -2, -3, ... appended."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = f"{day.isoformat()}_{audio_stem}"
+    candidate = out_dir / f"{base}.md"
+    if not candidate.exists():
+        return candidate
+    suffix = 2
+    while True:
+        candidate = out_dir / f"{base}-{suffix}.md"
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def write_markdown_note(
+    sections: dict[str, str],
+    transcript: Transcript,
+    source: Path,
+    out_dir: Path,
+    whisper_model: str,
+    llm: str,
+    *,
+    day: date | None = None,
+) -> Path:
+    """Write one markdown note. Create out_dir and never overwrite an existing file."""
+    written_on = day or date.today()
+    text = render_markdown_note(
+        sections,
+        transcript,
+        source_name=source.name,
+        day=written_on,
+        whisper_model=whisper_model,
+        llm=llm,
+    )
+    path = unique_note_path(out_dir, source.stem, written_on)
+    path.write_text(text, encoding="utf-8", newline="\n")
+    return path
 
 
 def generate_notes(
