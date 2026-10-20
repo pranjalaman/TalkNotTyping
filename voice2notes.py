@@ -5,14 +5,39 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 SUPPORTED_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm"}
 
 
+@dataclass(frozen=True)
+class Transcript:
+    text: str
+    language: str
+    duration: float
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the voice-to-notes pipeline."""
-    parse_args(argv)
+    args = parse_args(argv)
+    if not args.files:
+        return
+    model = load_whisper_model(args.whisper_model)
+    printed = False
+    for path in args.files:
+        try:
+            transcript = transcribe_file(model, path, args.lang)
+        except Exception as exc:
+            print(f"Skipping {path}: {exc}", file=sys.stderr)
+            continue
+        if not transcript.text:
+            print(f"Warning: no speech detected in {path}", file=sys.stderr)
+            continue
+        if printed:
+            print()
+        print(transcript.text)
+        printed = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,6 +129,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit(2)
     args.files = validate_audio_files(args.files)
     return args
+
+
+def load_whisper_model(name: str):
+    """Load faster-whisper on CPU with int8 weights."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print(
+            "faster-whisper is not installed. Run: pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    try:
+        return WhisperModel(name, device="cpu", compute_type="int8")
+    except Exception as exc:
+        print(f"Could not load Whisper model '{name}': {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def transcribe_file(model, path: Path, language: str | None) -> Transcript:
+    """Transcribe one file. VAD drops silence. Language is auto-detected when omitted."""
+    segments, info = model.transcribe(
+        str(path),
+        language=language,
+        vad_filter=True,
+    )
+    text = " ".join(
+        segment.text.strip() for segment in segments if segment.text.strip()
+    )
+    return Transcript(text=text, language=info.language, duration=info.duration)
 
 
 if __name__ == "__main__":
