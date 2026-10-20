@@ -44,6 +44,8 @@ def main(argv: list[str] | None = None) -> None:
             print()
         print(transcript.text)
         printed = True
+        print()
+        print(generate_notes(transcript.text, args.llm))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -243,6 +245,37 @@ def _exit_ollama_not_running(model: str) -> NoReturn:
 def _exit_model_not_pulled(model: str) -> NoReturn:
     print(ollama_setup_message(model), file=sys.stderr)
     raise SystemExit(1)
+
+
+# NOTES_SYSTEM_PROMPT is the only notes prompt. Edit this constant.
+NOTES_SYSTEM_PROMPT = """\
+You turn messy spoken transcripts into clean notes. Use only what is in the transcript. Do not invent tasks, names, dates, or facts. If there are no action items, write None.
+
+The user message is the transcript. Return markdown with exactly these headings:
+## Title
+## Summary
+## Action items
+## Key points
+
+Spoken-language cleanup:
+- Remove filler words.
+- Resolve "um, I mean" self-corrections. Keep the corrected meaning and drop the abandoned attempt.
+- Keep the user's own wording for names and technical terms.
+"""
+
+
+def generate_notes(
+    transcript: str,
+    model: str,
+    *,
+    url: str = OLLAMA_CHAT_URL,
+) -> str:
+    """Send a transcript to the Ollama client and return the notes reply."""
+    messages = [
+        {"role": "system", "content": NOTES_SYSTEM_PROMPT},
+        {"role": "user", "content": transcript},
+    ]
+    return ollama_chat(model, messages, url=url)
 
 
 if __name__ == "__main__":
