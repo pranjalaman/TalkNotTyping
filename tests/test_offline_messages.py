@@ -295,7 +295,7 @@ class ExistingErrorTableTests(unittest.TestCase):
 
             seen: list[str] = []
 
-            def generate(transcript: str, model: str, url: str = "") -> str:
+            def generate(transcript: str, model: str, *, url: str = "", style: str = "both") -> str:
                 seen.append(model)
                 self.assertEqual(transcript, "buy milk tomorrow")
                 return (
